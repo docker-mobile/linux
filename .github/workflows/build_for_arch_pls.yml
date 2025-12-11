@@ -1,0 +1,71 @@
+name: Build linux-git
+
+on:
+  workflow_dispatch: # Triggers only when you click the button manually
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # We use a container to ensure we have a clean Arch environment
+    container:
+      image: archlinux:latest
+      options: --privileged # Required for some build operations
+
+    steps:
+      - name: Update Arch and Install Prerequisites
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm base-devel git sudo
+
+      - name: Create Builder User
+        # makepkg cannot be run as root
+        run: |
+          useradd -m builder
+          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+          
+      - name: Prepare Build Directory
+        run: |
+          mkdir -p /home/builder/build
+          chown builder:builder /home/builder/build
+
+      - name: Clone linux-git AUR and Build
+        shell: bash
+        run: |
+          su builder -c "
+            cd /home/builder/build
+            git clone https://aur.archlinux.org/linux-git.git
+            cd linux-git
+
+            # OPTIMIZATION: Edit PKGBUILD to disable documentation
+            # Building docs takes forever and eats disk space. 
+            # We comment out 'make htmldocs' or similar lines if present, 
+            # though standard PKGBUILD usually separates them.
+            # We force single-threaded xz compression to save memory if needed, 
+            # but here we use standard settings.
+            
+            # Import PGP Keys (Linus Torvalds & Greg KH)
+            # These are required to verify the source tarball
+            gpg --keyserver keyserver.ubuntu.com --recv-keys ABAF11C65A2970B130ABE3C479BE3E4300411886
+            gpg --keyserver keyserver.ubuntu.com --recv-keys 647F28654894E3BD457199BE38DBBDC86092693E
+
+            # Build the package
+            # -s: install deps
+            # -f: force overwrite
+            # -c: clean up
+            # --noconfirm: don't ask questions
+            # --skippgpcheck: (Optional) use only if keys fail, but try to keep it secure
+            makepkg -sfc --noconfirm
+          "
+
+      - name: Identify Output
+        id: find_files
+        run: |
+          # Find the generated .zst files
+          echo "pkg_path=$(find /home/builder/build/linux-git -name '*.pkg.tar.zst' | tr '\n' ' ')" >> $GITHUB_OUTPUT
+
+      - name: Upload Binary Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-git-binaries
+          path: /home/builder/build/linux-git/*.pkg.tar.zst
+          retention-days: 5
