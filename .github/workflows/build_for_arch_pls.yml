@@ -1,71 +1,103 @@
-name: Build linux-git
+name: Build Arch-style x86_64 kernel (bin)
 
 on:
-  workflow_dispatch: # Triggers only when you click the button manually
+  push:
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    # We use a container to ensure we have a clean Arch environment
     container:
       image: archlinux:latest
-      options: --privileged # Required for some build operations
 
     steps:
-      - name: Update Arch and Install Prerequisites
+      - uses: actions/checkout@v4
+
+      - name: Init pacman
         run: |
+          pacman-key --init
+          pacman-key --populate archlinux
           pacman -Syu --noconfirm
-          pacman -S --noconfirm base-devel git sudo
 
-      - name: Create Builder User
-        # makepkg cannot be run as root
+      - name: Install deps
         run: |
-          useradd -m builder
-          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
-          
-      - name: Prepare Build Directory
+          pacman -S --noconfirm \
+            base-devel git bc libelf pahole cpio \
+            kmod inetutils python mkinitcpio
+
+      - name: Configure kernel
         run: |
-          mkdir -p /home/builder/build
-          chown builder:builder /home/builder/build
+          make mrproper
+          cp config .config
+          make olddefconfig
 
-      - name: Clone linux-git AUR and Build
-        shell: bash
+      - name: Build kernel
         run: |
-          su builder -c "
-            cd /home/builder/build
-            git clone https://aur.archlinux.org/linux-git.git
-            cd linux-git
+          make -j$(nproc)
+          make modules_install INSTALL_MOD_PATH=modules
 
-            # OPTIMIZATION: Edit PKGBUILD to disable documentation
-            # Building docs takes forever and eats disk space. 
-            # We comment out 'make htmldocs' or similar lines if present, 
-            # though standard PKGBUILD usually separates them.
-            # We force single-threaded xz compression to save memory if needed, 
-            # but here we use standard settings.
-            
-            # Import PGP Keys (Linus Torvalds & Greg KH)
-            # These are required to verify the source tarball
-            gpg --keyserver keyserver.ubuntu.com --recv-keys ABAF11C65A2970B130ABE3C479BE3E4300411886
-            gpg --keyserver keyserver.ubuntu.com --recv-keys 647F28654894E3BD457199BE38DBBDC86092693E
-
-            # Build the package
-            # -s: install deps
-            # -f: force overwrite
-            # -c: clean up
-            # --noconfirm: don't ask questions
-            # --skippgpcheck: (Optional) use only if keys fail, but try to keep it secure
-            makepkg -sfc --noconfirm
-          "
-
-      - name: Identify Output
-        id: find_files
+      - name: Get kernel version
         run: |
-          # Find the generated .zst files
-          echo "pkg_path=$(find /home/builder/build/linux-git -name '*.pkg.tar.zst' | tr '\n' ' ')" >> $GITHUB_OUTPUT
+          echo "KVER=$(make kernelrelease)" >> $GITHUB_ENV
 
-      - name: Upload Binary Artifacts
-        uses: actions/upload-artifact@v4
+      - name: Create Arch-style layout
+        run: |
+          mkdir -p pkg/usr/lib/modules/$KVER
+          cp arch/x86/boot/bzImage pkg/usr/lib/modules/$KVER/vmlinuz
+          cp -r modules/lib/modules/$KVER/* pkg/usr/lib/modules/$KVER/
+
+          echo "linux-docker-mobile-git-bin" \
+            > pkg/usr/lib/modules/$KVER/pkgbase
+
+      - name: Add mkinitcpio preset
+        run: |
+          mkdir -p pkg/etc/mkinitcpio.d
+          cat > pkg/etc/mkinitcpio.d/linux-docker-mobile-git-bin.preset <<EOF
+          ALL_config="/etc/mkinitcpio.conf"
+          ALL_kver="$KVER"
+          PRESETS=('default')
+
+          default_image="/boot/initramfs-linux-docker-mobile-git-bin.img"
+          default_options=""
+          EOF
+
+      - name: Add pacman hooks
+        run: |
+          mkdir -p pkg/usr/share/libalpm/hooks
+
+          cat > pkg/usr/share/libalpm/hooks/90-linux-docker-mobile-install.hook <<EOF
+          [Trigger]
+          Type = Package
+          Operation = Install
+          Operation = Upgrade
+          Target = linux-docker-mobile-git-bin
+
+          [Action]
+          Description = Updating initramfs...
+          When = PostTransaction
+          Exec = /usr/bin/mkinitcpio -P
+          EOF
+
+          cat > pkg/usr/share/libalpm/hooks/60-linux-docker-mobile-remove.hook <<EOF
+          [Trigger]
+          Type = Package
+          Operation = Remove
+          Target = linux-docker-mobile-git-bin
+
+          [Action]
+          Description = Removing initramfs...
+          When = PreTransaction
+          Exec = /usr/bin/rm -f /boot/initramfs-linux-docker-mobile-git-bin.img
+          EOF
+
+      - name: Package binaries
+        run: |
+          tar -C pkg -czf linux-docker-mobile-git-bin.tar.gz .
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
         with:
-          name: linux-git-binaries
-          path: /home/builder/build/linux-git/*.pkg.tar.zst
-          retention-days: 5
+          tag_name: latest
+          name: latest
+          files: linux-docker-mobile-git-bin.tar.gz
